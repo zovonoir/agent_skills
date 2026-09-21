@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from bisect import bisect_right
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1322,6 +1323,70 @@ def match_timed_event(events: Sequence, probe_ts: float):
     return min(events, key=lambda item: abs(item.ts - probe_ts))
 
 
+class ActiveFrameIndex:
+    """Point-stabbing index over one thread's Python frames.
+
+    A single eager trace thread can hold millions of frames, so scanning the
+    whole list per kernel does not finish in reasonable time. Frames are sorted
+    by start and covered by a max-end segment tree, which makes each lookup cost
+    proportional to the stack depth actually returned.
+    """
+
+    def __init__(self, frames: Sequence[PythonFrame]) -> None:
+        ordered = sorted(frames, key=lambda item: item.ts)
+        self._frames = ordered
+        self._starts = [item.ts for item in ordered]
+        size = 1
+        while size < len(ordered):
+            size *= 2
+        self._size = size
+        tree = [float("-inf")] * (2 * size)
+        for offset, item in enumerate(ordered):
+            tree[size + offset] = item.end_ts
+        for node in range(size - 1, 0, -1):
+            tree[node] = max(tree[2 * node], tree[2 * node + 1])
+        self._tree = tree
+
+    def active_at(self, ts: float) -> List[PythonFrame]:
+        limit = bisect_right(self._starts, ts)
+        if limit == 0:
+            return []
+        found: List[PythonFrame] = []
+        self._collect(1, 0, self._size, limit, ts, found)
+        return found
+
+    def _collect(
+        self,
+        node: int,
+        low: int,
+        high: int,
+        limit: int,
+        ts: float,
+        found: List[PythonFrame],
+    ) -> None:
+        if low >= limit or self._tree[node] < ts:
+            return
+        if high - low == 1:
+            found.append(self._frames[low])
+            return
+        middle = (low + high) // 2
+        self._collect(2 * node, low, middle, limit, ts, found)
+        self._collect(2 * node + 1, middle, high, limit, ts, found)
+
+
+_ACTIVE_FRAME_INDEXES: Dict[int, Tuple[Sequence[PythonFrame], ActiveFrameIndex]] = {}
+
+
+def get_active_frame_index(frames: Sequence[PythonFrame]) -> ActiveFrameIndex:
+    key = id(frames)
+    cached = _ACTIVE_FRAME_INDEXES.get(key)
+    if cached is not None and cached[0] is frames:
+        return cached[1]
+    index = ActiveFrameIndex(frames)
+    _ACTIVE_FRAME_INDEXES[key] = (frames, index)
+    return index
+
+
 def find_active_python_frames(
     cpu_op: CpuOpEvent,
     python_frames: Dict[Tuple[str, str], List[PythonFrame]],
@@ -1330,7 +1395,7 @@ def find_active_python_frames(
     if not frames:
         return []
     probe_ts = cpu_op.ts + min(cpu_op.dur * 0.5, 1.0)
-    active = [item for item in frames if item.ts <= probe_ts <= item.end_ts]
+    active = get_active_frame_index(frames).active_at(probe_ts)
     active.sort(key=lambda item: (item.ts, item.end_ts))
     return active
 
@@ -1345,7 +1410,7 @@ def find_active_python_frames_at_ts(
     frames = python_frames.get((pid, tid), [])
     if not frames:
         return []
-    active = [item for item in frames if item.ts <= ts <= item.end_ts]
+    active = get_active_frame_index(frames).active_at(ts)
     active.sort(key=lambda item: (item.ts, item.end_ts))
     return active
 
