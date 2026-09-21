@@ -25,6 +25,8 @@ Unless the user specifies otherwise:
 - Keep CUDA Graph enabled.
 - Capture a short delayed window after startup and warmup.
 - Merge per-rank ROCpd files into one database.
+- Add `--enable-layerwise-nvtx-marker` when kernels need to be traced back to
+  model source, then relabel the markers before viewing.
 
 Profiling timings are not benchmark results.
 
@@ -37,9 +39,13 @@ Profiling timings are not benchmark results.
 - Write profiler output to container-local `/tmp`, then copy completed files
   to a mounted host directory.
 - Include `%pid%` in the output filename.
+- Size the collection window generously and keep the server idle on both sides
+  of the measured run. Never try to hit a narrow window precisely.
 - Do not pass `--disable-cuda-graph`.
 - Preserve `--disable-radix-cache` for this Qwen3.8 first-knife path.
 - Validate databases before delivery.
+- Anchor all ranks to one time origin when merging, and never "correct" rank
+  timestamps by shifting them.
 - Never claim CPU call stacks were collected unless the database contains
   nonempty samples/call-stack data.
 
@@ -101,7 +107,10 @@ Proceed only when rocprofv3 exits 0 and SQLite integrity is `ok`.
 ## 2. Start the Graph-enabled profiled server
 
 Choose a delayed collection window long enough for model loading, decode Graph
-capture, and one warmup. This example collects from second 300 through 390:
+capture, and one warmup. Read the window-timer section below before picking the
+numbers; the window does not open when you think it does.
+
+This example nominally collects from second 600 through 1200:
 
 ```bash
 docker run --rm --name MODEL-graph-trace -w /app \
@@ -120,7 +129,7 @@ docker run --rm --name MODEL-graph-trace -w /app \
       --output-file model-graph-2k5-tp2-%pid% \
       --output-format rocpd \
       --runtime-trace \
-      --collection-period 300:90:1 -- \
+      --collection-period 600:600:1 -- \
       python -m sglang.launch_server \
         --model-path /model \
         --host 0.0.0.0 --port 30080 \
@@ -147,6 +156,65 @@ The server is fired up and ready to roll!
 Graph may be automatically disabled by this model path; that does not mean
 decode Graph is disabled.
 
+## 2a. The collection-period timer is per process
+
+`--collection-period` delay is counted from the moment rocprofiler initializes
+inside each process, not from `docker run`. SGLang scheduler ranks are forked
+children, so their timer starts late and the real window slides later by that
+amount. Measured on this Qwen3.8 path:
+
+```text
+t=0s     docker run
+t=44s    sglang::scheduler_TP0 / TP1 appear   <- delay is counted from here
+t=664s   window actually opens    (44 + 600)
+t=1264s  window actually closes   (44 + 600 + 600)
+```
+
+The offset is not a constant. It depends on weight load speed, JIT, and decode
+Graph capture time. A run scheduled against container time can silently fall
+outside the window and produce a database with none of the measured work.
+
+This already caused one lost collection. With `--collection-period 420:120:1`
+and two identical requests at container time 431 and 481, only the second one
+landed inside the window. A 120-second window cannot absorb a 44-second drift.
+
+### Use a wide window instead of precise timing
+
+An open window over an idle server costs nothing. rocprofiler only records when
+HIP calls and kernel dispatches actually happen, so an idle window produces no
+events, no buffer growth, and no database growth. Scheduler RSS measured while
+the window was open and the server idle:
+
+```text
+t=905s   10.63 GB
+t=920s   10.63 GB   window open, no GPU activity
+t=951s   10.63 GB   RSS completely flat
+```
+
+So prefer a window wide enough that drift cannot matter, and leave the server
+idle on both ends. Database size is determined only by the work actually run
+inside the window, never by how long the window stays open.
+
+### Calibrating the offset when you need it
+
+Poll for the scheduler process instead of guessing:
+
+```bash
+T0=$(date +%s)
+while ! docker exec CONTAINER pgrep -f 'sglang::scheduler_TP0' >/dev/null 2>&1; do
+  sleep 1
+done
+echo "timer origin t=$(( $(date +%s) - T0 ))s; window opens at origin + DELAY"
+```
+
+### No event-based trigger exists in 1.1.0
+
+rocprofv3 1.1.0 gates collection by time only. `--kernel-iteration-range`
+counts kernel dispatches, which is unusable when one pass dispatches tens of
+thousands of kernels. `--marker-trace` records ROCTx ranges but does not gate
+collection. There is no signal or API to start and stop a window on demand, so
+the wide-window approach is the only reliable option on this image.
+
 ## 3. Warm up and capture
 
 Run this once before the collection window, then once inside the window:
@@ -169,9 +237,9 @@ docker exec MODEL-graph-trace \
     --disable-tqdm
 ```
 
-The benchmark client sends `temperature: 0.0`. Leave several seconds of margin
-at both ends of the collection window. If child-process timer alignment is
-uncertain, issue a second identical request near the middle of the window.
+The benchmark client sends `temperature: 0.0`. Leave at least a hundred seconds
+of idle margin at both ends of the collection window rather than a few seconds,
+because the window boundary is not where the nominal delay puts it.
 
 ## 4. Finalize each scheduler rank
 
@@ -214,7 +282,20 @@ rocpd merge \
   -d . -o model-graph-2k5-tp2-unified
 ```
 
-If the installed `rocpd` has no `merge` subcommand, merge manually:
+The ROCm 7.2.4 ATOM image ships rocprofv3 1.1.0, whose `rocpd` exposes only
+`convert`, `query`, and `summary`. Expect to merge manually there.
+
+If the installed `rocpd` has no `merge` subcommand, use
+[scripts/merge_rocpd.py](scripts/merge_rocpd.py), which also applies the time
+anchor described below:
+
+```bash
+python3 scripts/merge_rocpd.py \
+  model-graph-2k5-tp2-rank0.db model-graph-2k5-tp2-rank1.db \
+  model-graph-2k5-tp2-unified.db
+```
+
+What it does:
 
 1. Copy rank0 as the output database.
 2. Attach rank1 with SQLite.
@@ -222,10 +303,83 @@ If the installed `rocpd` has no `merge` subcommand, merge manually:
 4. Recreate each base `rocpd_*` view as `UNION ALL` over matching UUID tables.
 5. Keep higher-level views from rank0; they join by both ID and GUID, so they
    work across both ranks.
-6. Run `VACUUM` and `PRAGMA integrity_check`.
+6. Add a time-origin anchor to every late-starting rank.
+7. Run `VACUUM` and `PRAGMA integrity_check`.
 
 Do not concatenate tables while dropping the GUID. IDs overlap across ranks;
 GUID is required to prevent invalid cross-rank joins.
+
+## 5a. Per-rank time origins make collectives look staggered
+
+Merged timestamps are already correct. Every rank sits on the same system clock
+domain and absolute values are directly comparable. The trap is on the viewing
+side: a viewer that zeroes each process against that process's own first event
+injects the gap between process start times into every kernel on that rank.
+
+The symptom is a synchronizing collective that appears to run at different
+times on each GPU while showing nearly identical durations. Observed on this
+Qwen3.8 path, where the two profiler sessions started 626.303 us apart:
+
+```text
+allgather_vec, per-rank origins
+  GPU0 start 5566.945597 ms   dur 0.170600 ms
+  GPU1 start 5566.315777 ms   dur 0.171121 ms   <- finishes before GPU0 starts
+
+allgather_vec, one shared origin
+  GPU0 start 5566.945597 ms
+  GPU1 start 5566.942080 ms                     <- real gap is 3.5 us
+```
+
+That picture is physically impossible for a signal-based collective, which is
+the tell that the origin is wrong rather than the data. Durations stay correct
+because the normalization only translates the timeline.
+
+Short kernels expose this and long ones hide it. At a 626 us origin gap, a
+170 us `allgather_vec` shows zero interval overlap between ranks, while a
+1.8 ms `ncclDevKernel` still overlaps 100% and looks fine.
+
+### Shifting timestamps cannot fix it
+
+Per-process normalization is shift-invariant. Adding an offset to one rank
+moves that rank's own minimum by the same amount, so the subtraction cancels
+and the display does not change:
+
+```text
+before  display = t - origin
+after   display = (t + s) - (origin + s) = t - origin
+```
+
+The only way to move the display is to change which event is the minimum.
+
+### Fix: anchor every rank to one origin
+
+`merge_rocpd.py` inserts one zero-work region named `ROCPD_MERGE_TIME_ANCHOR`
+into each late-starting rank, placed at the earliest event across all ranks.
+Every process then reports the same first-event timestamp, so per-process
+normalization becomes global normalization. Verified result:
+
+| | merge without anchor | merge with anchor |
+| --- | --- | --- |
+| origin gap between ranks | 626.303 us | 0.000 us |
+| `ar_ll128` median delta / overlap | 50.83 us / 6.7% | 2.56 us / 100% |
+| `allgather_vec` median delta / overlap | 628.22 us / 0% | 2.91 us / 100% |
+
+Nothing else changes. Kernel dispatch count, total GPU time, and Graph launch
+count stay identical; only one region row and one string row are added.
+
+For inspection outside a viewer, use
+[scripts/export_global_timeline.py](scripts/export_global_timeline.py). It
+writes a CSV of every kernel on one shared origin, keeping the per-rank value
+in a second column so the two conventions can be compared directly, plus a
+paired table of communication kernels with an interval-overlap flag.
+
+### Do not confuse this with real rank skew
+
+Genuine entry skew survives the fix and must not be anchored away. On this path
+`cross_device_reduce` still showed a 836 us median entry gap after anchoring,
+with rank0 arriving first in 79.6% of launches, while `ar_ll128` in the same
+trace aligned to 2.56 us. A residual gap on one collective family only, with
+others tightly aligned, is a load-imbalance signal and not a clock artifact.
 
 ## 6. Validate the unified trace
 
@@ -244,6 +398,19 @@ assert con.execute("SELECT COUNT(*) FROM rocpd_kernel_dispatch").fetchone()[0] >
 assert con.execute(
     "SELECT COUNT(*) FROM regions WHERE name LIKE 'hipGraphLaunch%'"
 ).fetchone()[0] > 0
+
+# All ranks must report the same first-event timestamp, or collectives will
+# look staggered in any viewer that zeroes each process separately.
+origins = con.execute(
+    """
+    SELECT pid, MIN(start) FROM (
+        SELECT pid, start FROM regions
+        UNION ALL
+        SELECT pid, start FROM kernels
+    ) GROUP BY pid
+    """
+).fetchall()
+assert len({value for _, value in origins}) == 1, origins
 
 print("size", os.path.getsize(p))
 print("processes", con.execute(
@@ -268,6 +435,145 @@ For communication analysis, search kernel names for:
 - `allreduce`, `all_reduce`, `rccl`, or `nccl`
 
 Stop the container and verify GPU memory is released.
+
+## 7. Attributing kernels to model source
+
+A default `--runtime-trace` database answers "which HIP call launched this
+kernel" but not "where in the model that call came from". Both halves need
+care, and the second one needs an extra server flag.
+
+### Kernel to HIP API: use the stack, not the correlation id
+
+`rocpd_event.correlation_id` is not populated by rocprofv3 1.1.0. Every row
+holds `0`, so any join on `corr_id` silently collapses the whole trace onto one
+arbitrary region:
+
+```text
+rocpd_event.correlation_id: 227014 rows, 1 distinct value, all zero
+```
+
+Use `stack_id` and `parent_stack_id` instead. A kernel dispatch event's
+`parent_stack_id` is the `stack_id` of the region that launched it, and the
+chain walks upward from there. That resolved all 22602 kernels with no misses,
+and it distinguishes Graph replay from eager launches:
+
+```text
+   960x  aiter::dynamic_per_token_scaled_quant   <- hipGraphLaunch
+   785x  _gated_pointwise_kernel                 <- hipModuleLaunchKernel
+   485x  Cijk_..._MT256x256x32                   <- hipExtModuleLaunchKernel
+```
+
+Also avoid joining through the `regions` view for this. It carries a correlated
+subquery for `category` and no index on the join column; the same query that
+took nine minutes there finished in 0.6 seconds against the concrete
+`rocpd_*_<uuid>` tables.
+
+Without markers the chain stops at the HIP API. `call_stack` and `line_info`
+are `{}` throughout, and the only semantic name available is `ncclAllReduce`
+from `RCCL_API`.
+
+### HIP API to model source: enable layerwise markers
+
+Add to the server launch:
+
+```text
+--enable-layerwise-nvtx-marker
+```
+
+SGLang registers forward hooks that push one NVTX range per module.
+`torch.cuda.nvtx` maps to ROCTx on ROCm, and `--runtime-trace` already collects
+the Marker API, so nothing changes on the rocprofv3 side. Module ranges nest,
+so the marker chain above a kernel reconstructs the module path:
+
+```text
+model.model
+  model.model.layers.3
+    model.model.layers.3.self_attn
+      model.model.layers.3.self_attn.qkv_proj
+        hipLaunchKernel
+          ck::kernel_gemm_xdl_cshuffle_v3_multi_d_b_preshuffle_2lds<...>
+```
+
+Measured coverage on 2048/5 at concurrency 32:
+
+| Phase | Kernels | Attributed to a module | GPU time |
+| --- | ---: | ---: | ---: |
+| eager / prefill | 12812 | 11560 (90.2%) | 5428 ms |
+| Graph replay / decode | 9790 | 0 (0.0%) | 110 ms |
+
+Decode gets nothing, because PyTorch forward hooks do not run during Graph
+replay. Accept this rather than disabling Graph: prefill dominates this
+workload, and a graph-off run would no longer be the configuration under study.
+
+The flag is effectively free here. A measured pass took 5.66 s with markers
+against 5.62 s without, inside run-to-run noise, because the hooks only run on
+the Python side during prefill.
+
+### Relabel markers before viewing
+
+rocprofv3 names every ROCTx region after the API that produced it, so a viewer
+shows a stack of identical `roctxThreadRangeA` rows. The pushed text lives in
+`rocpd_event.extdata` as a JSON `message` field and never reaches
+`region.name_id`, which points at the single string `roctxThreadRangeA` for all
+marker rows.
+
+The nesting is already correct at that point; only the labels are missing. Fix
+it with [scripts/relabel_roctx_markers.py](scripts/relabel_roctx_markers.py):
+
+```bash
+python3 scripts/relabel_roctx_markers.py unified.db unified-labeled.db
+```
+
+Two details matter when parsing. The `message` is SQL-escaped, so single quotes
+in the Python dict repr arrive doubled, and `rocpd_string.string` is UNIQUE, so
+new labels need `INSERT OR IGNORE` followed by a lookup.
+
+Verified end state in ROCm Optiq: readable module call stacks, kernels visible
+inside Graph regions, and ranks aligned on one time origin.
+
+## Profiling overhead
+
+Measured on Qwen3.8-Flash-Next PTPC-FP8, TP2/EP1, decode Graph enabled, 32
+concurrent requests, `--runtime-trace`, on two MI308X. Four conditions, where B
+and C share one server instance so model load, JIT, and Graph capture are
+identical:
+
+| Condition | 2048/5 duration | 2048/1024 duration |
+| --- | --- | --- |
+| A no profiler | 5.51 s | 27.36 s |
+| B attached, window closed | 5.54 s (+0.4%) | 27.57 s (+0.8%) |
+| C attached, window collecting | 5.62 s (+1.9%) | 30.16 s (+10.2%) |
+| D attached, window reopened closed | 5.52 s (+0.0%) | 27.36 s (-0.0%) |
+
+Read this as two separate costs:
+
+- Merely having rocprofv3 attached is free. Both B deltas sit inside run-to-run
+  noise, which is about 1% on this path. A long-lived service can stay wrapped
+  and open a window only when needed.
+- Active collection is cheap for short decode and expensive for long decode.
+  The 2048/5 case moves 1.9%, so its trace is representative. The 2048/1024
+  case moves 10.2%, so absolute times from such a trace must not be quoted as
+  serving performance.
+
+Overhead also grows within a window as the event buffer fills. The two
+2048/1024 passes inside one window measured 29.26 s then 31.07 s, tracking
+scheduler RSS growth from 10.22 GB to 10.63 GB. Prefer short windows containing
+few passes over long windows accumulating many.
+
+### Measuring overhead on a new path
+
+Condition D is what makes the result trustworthy. Without it, a slowdown during
+collection cannot be separated from drift, thermal effects, or cache state.
+Re-run the same case after the window closes and confirm both throughput and
+RSS return to baseline.
+
+Use RSS as the independent check that the window is really open. Run load
+during the expected closed phase and confirm RSS stays flat, then run the same
+load inside the window and confirm RSS climbs. This is more reliable than
+trusting the nominal window arithmetic.
+
+Collect throughput numbers only. Kill the container without finalizing so no
+time is spent generating a database that will be discarded.
 
 ## CPU call-stack collection
 
@@ -478,8 +784,11 @@ Do not use the wrapper workflow for multi-process SGLang and do not deliver its
 failed output.
 
 Also note that native sampling commonly shows CPython/native C++ frames rather
-than rich Python function names. For Python-level call stacks, use Torch
-Profiler separately; those traces are not the same ROCpd artifact.
+than rich Python function names, which makes it a poor way to locate model
+code. For source attribution inside a ROCpd trace, prefer the ROCTx marker
+route in section 7; it keeps CUDA Graph enabled and needs no rebuilt profiler.
+Use Torch Profiler when full Python call stacks are required; those traces are
+not the same ROCpd artifact.
 
 ## Report back
 
@@ -487,9 +796,15 @@ Include:
 
 - Model, TP/EP, GPU count, input/output lengths.
 - Whether decode CUDA Graph capture succeeded.
-- Collection window and trace type.
+- Collection window and trace type, plus how the measured run was confirmed to
+  fall inside the real window rather than the nominal one.
+- Which measured passes landed inside the window, and which were dropped.
 - Unified database path and size.
 - Process/GPU/kernel/Graph-launch counts.
-- Communication kernel names found.
+- Confirmation that all ranks share one time origin after merging.
+- Communication kernel names found, and whether any residual entry skew looks
+  like real load imbalance rather than a normalization artifact.
+- Whether layerwise markers were enabled, and the share of kernels attributed
+  to a module split by prefill and Graph-replay decode.
 - Explicit CPU call-stack status and any version blocker.
 - Confirmation that the container stopped and GPUs were released.
