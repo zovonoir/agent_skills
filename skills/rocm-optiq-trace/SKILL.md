@@ -808,3 +808,71 @@ Include:
   to a module split by prefill and Graph-replay decode.
 - Explicit CPU call-stack status and any version blocker.
 - Confirmation that the container stopped and GPUs were released.
+
+## Known issues: rocprofv3 1.3.5 (ROCm 10 / TheRock wheels)
+
+Observed on `dsv41f-dp8ep8-mori:1021` (vLLM DP8+EP8, MI355X), where rocprofv3
+1.3.5 lives under `/usr/local/lib/python3.12/dist-packages/_rocm_sdk_devel/`
+and `/opt/rocm/.info/version` does not exist. Check these before spending time.
+
+### `rocprofv3 --attach` does not work; do not debug it
+
+1.3.5 advertises `--attach PID`, `--attach-children`, and
+`--attach-duration-msec`. On this image every attach fails:
+
+```text
+Cannot attach to process N: 'rocp-bg-attach' thread not found. The target
+process does not appear to have attach support enabled. Start the target with
+ROCP_TOOL_ATTACH=1, ...
+```
+
+None of the following fixed it on a small torch target:
+
+- Starting the target with `ROCP_TOOL_ATTACH=1`.
+- Overriding the image default `ROCPROFILER_QUEUE_INTERPOSITION=0` with `1`.
+- `LD_PRELOAD` of `librocprofiler-sdk-attach.so`: it maps into the process,
+  but no `rocp-bg-attach` thread is ever created.
+
+`ROCPROFILER_REGISTER_LOG_LEVEL=trace` shows rocprofiler-register only
+registering the hip/hsa tables, without ever trying to load the attach library.
+Root cause unknown, probably a build configuration problem. Run one 20-second
+smoke test; if the thread is missing, go straight to the wrapper workflow
+below.
+
+### Wrapper workflow works
+
+`rocprofv3 --runtime-trace --output-format rocpd --collection-period D:W:1 -- vllm serve ...`
+works with spawned children and CUDA Graph. Graph-replayed kernels show up as
+individual dispatches, and `hipGraphLaunch` is recorded. rocprofv3 execs into
+the target, so `pkill -f "vllm serve"` still matches.
+
+`kill -QUIT <pid>` behaves as described for 1.1.0: the database is written in
+about 5 s, then the process stays parked in the signal handler, so the other
+ranks are not disturbed. Graceful shutdown then hangs until SIGTERM.
+
+### vLLM DP: the timer origin is the Worker process
+
+In vLLM multiproc DP, GPU work runs in `VLLM::Worker_DP<i>_EP<i>`, a child of
+`VLLM::EngineCore_DP<i>`, which appears about 50 s after `docker run`.
+Compute the window from the worker start time (`ps -o etimes=`), send SIGQUIT
+to the workers, and merge only the worker databases. Startup under the wrapper
+took 382 s versus 341 s without it. `--collection-period 1500:1200:1` left
+about 20 minutes between warmup and the measured run with no drift risk.
+
+### Smaller traps
+
+- glog lines from rocprofv3 carry a thread ID, not necessarily the PID. Detect
+  finalization by a rising `tool finalization` count plus a nonempty
+  `<prefix>-<pid>_results.db`, not by matching the PID in the log.
+- `pkill -f PATTERN` inside `bash -c '...PATTERN...'` kills that same bash.
+- Files that the container copies into a host mount are owned by root. Chown
+  them through the image before handing them over.
+- `python -m rocpd` aborts with `No module named 'otf2'` because `__main__`
+  imports otf2 eagerly, even though `rocpd/merge.py` exists. Use
+  `scripts/merge_rocpd.py`.
+- Each rank's database is about 240 MB even for a 5-token decode, mostly
+  `rocpd_info_kernel_symbol` (about 19K JIT/AITER symbols per rank). Eight
+  merged ranks come to about 1.75 GB.
+- Collection overhead on the DSV4.1-Flash 100K/5 decode: mean TPOT went from
+  12.0 ms (window closed) to 32.4 ms (window open), much larger than the
+  Qwen3.8 numbers above. Never quote trace timings as serving performance.
